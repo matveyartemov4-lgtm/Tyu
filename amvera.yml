@@ -1,0 +1,11 @@
+meta:
+  environment: python
+  toolchain: pip
+build:
+  requirements: requirements.txt
+run:
+  script: main.py
+  persistence:
+    - found_usernames.db
+    - checker_session.session
+    
