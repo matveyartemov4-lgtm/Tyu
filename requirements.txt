@@ -1,0 +1,6 @@
+aiogram==3.13.0
+telethon
+aiohttp
+beautifulsoup4
+english-words
+aiosqlite
