@@ -1,6 +1,6 @@
-aiogram==3.13.0
+aiogram
 telethon
 aiohttp
 beautifulsoup4
-english-words
 aiosqlite
+english-words
