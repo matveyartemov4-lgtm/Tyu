@@ -136,7 +136,6 @@ class Engine:
         except Exception as e:
             logging.error(f"Ошибка Fragment: {e}")
             return 0
-
 # ==========================================
 # 4. РОТАЦИЯ СЕССИЙ (Multi-Session)
 # ==========================================
@@ -153,12 +152,13 @@ class MultiSessionChecker:
             logging.info(f"Запуск клиента {i}/2... (Следуй инструкциям в консоли)")
             await client.start()
             logging.info(f"✅ Telethon клиент {i} успешно авторизован.")
-                async def is_username_free(self, username: str) -> bool:
+
+    async def is_username_free(self, username: str) -> bool:
         client = self.clients[self.current_idx]
         self.current_idx = (self.current_idx + 1) % len(self.clients)
         
         try:
-            # Используем более простой метод проверки
+            # Используем метод проверки
             result = await client(CheckUsernameRequest(username=username))
             return result
         except FloodWaitError as e:
@@ -167,6 +167,9 @@ class MultiSessionChecker:
         except Exception:
             # Теперь бот не будет забивать логи ошибками, а просто пропустит имя
             return False
+            
+
+
             
 # ==========================================
 # 5. AIOGRAM: ИНТЕРФЕЙС
