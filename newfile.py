@@ -1,8 +1,10 @@
+print("⏳ Скрипт запускается... Загрузка библиотек (это может занять 10-20 секунд).")
+
 import asyncio
 import logging
 import random
 import re
-from typing import List, Dict, Optional
+import os
 
 import aiohttp
 import aiosqlite
@@ -15,278 +17,282 @@ from aiogram.filters import CommandStart
 
 from telethon import TelegramClient
 from telethon.tl.functions.account import CheckUsernameRequest
-from telethon.errors import RPCError
-from telethon.errors.rpcerrorlist import FloodWaitError, UsernameInvalidError
+from telethon.errors import FloodWaitError, UsernameInvalidError
 
 # ==========================================
-# 1. КОНФИГУРАЦИЯ (Заполни своими данными)
+# 1. КОНФИГУРАЦИЯ (Данные вставлены)
 # ==========================================
-BOT_TOKEN = "8932397702:AAGAIflL_RdUYXXFzZ5xPUH-FaWjgmaRvec"
-API_ID = 33248398       # Твой API ID от my.telegram.org
+BOT_TOKEN = "8932397702:AAGY7wdLp4dy96MeSH1lce86HqzClmmMEqk"
+API_ID = 33248398
 API_HASH = "6543087387b7b14fcafcca74d28b1158"
 
+MIN_LOCAL_SCORE = 30  
+WORKER_SLEEP = 6      
+
+# Автоматический выбор пути: Amvera (/data) или локальный Pydroid
+if os.path.exists("/data") and os.access("/data", os.W_OK):
+    DB_PATH = "/data/usernames.db"
+else:
+    DB_PATH = "usernames.db"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Переменная для защиты от дублирования кнопок
+msg_lock = None 
 
 # ==========================================
 # 2. БАЗА ДАННЫХ (SQLite)
 # ==========================================
 async def init_db():
-    """Создает таблицу для хранения юзернеймов, если её нет"""
-    async with aiosqlite.connect("found_usernames.db") as db:
+    dirname = os.path.dirname(DB_PATH)
+    if dirname: 
+        os.makedirs(dirname, exist_ok=True)
+        
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS usernames (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE,
+                username TEXT PRIMARY KEY,
                 total_score INTEGER,
                 is_dict BOOLEAN,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                readability INTEGER,
+                fragment_score INTEGER
             )
         """)
         await db.commit()
 
-async def save_to_db(username: str, score: int, is_dict: bool):
-    """Безопасно сохраняет юзернейм в базу данных"""
+async def save_username(username: str, score: int, is_dict: bool, read: int, frag: int):
     try:
-        async with aiosqlite.connect("found_usernames.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "INSERT OR IGNORE INTO usernames (username, total_score, is_dict) VALUES (?, ?, ?)",
-                (username, score, is_dict)
+                "INSERT OR IGNORE INTO usernames VALUES (?, ?, ?, ?, ?)",
+                (username, score, is_dict, read, frag)
             )
             await db.commit()
     except Exception as e:
-        logging.error(f"Ошибка записи в БД: {e}")
+        logging.error(f"Ошибка сохранения в БД: {e}")
 
-async def get_top_from_db() -> List[Dict]:
-    """Достает ТОП-50 юзернеймов из базы данных"""
-    async with aiosqlite.connect("found_usernames.db") as db:
-        async with db.execute(
-            "SELECT username, total_score, is_dict FROM usernames ORDER BY total_score DESC LIMIT 50"
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [
-                {"username": row[0], "total_score": row[1], "is_dict": bool(row[2])}
-                for row in rows
-            ]
+async def get_top_10():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT username, total_score, is_dict FROM usernames ORDER BY total_score DESC LIMIT 10") as cursor:
+            return await cursor.fetchall()
 
 # ==========================================
-# 3. ГЕНЕРАТОР И СЛОВАРЬ
+# 3. ДВИЖОК: ГЕНЕРАЦИЯ И ОЦЕНКА
 # ==========================================
-class UsernameGenerator:
+class Engine:
     def __init__(self):
+        print("⏳ Загрузка словаря...")
         words = get_english_words_set(['web2'], lower=True)
-        self.dictionary_words = {w for w in words if len(w) == 5 and w.isalpha()}
-        self.used_combinations = set()
+        self.dict_words = {w for w in words if len(w) == 5 and w.isalpha()}
+        self.vowels = set("aeiouy")
+        print("✅ Словарь загружен!")
 
-    def get_next_batch(self, batch_size=10) -> List[str]:
-        batch = []
-        available_words = list(self.dictionary_words - self.used_combinations)
+    def generate_word(self) -> str:
+        if random.random() > 0.5 and self.dict_words:
+            return random.choice(list(self.dict_words))
+        else:
+            c = "bcdfghjklmnpqrstvwxz"
+            v = "aeiouy"
+            return random.choice(c) + random.choice(v) + random.choice(c) + random.choice(v) + random.choice(c)
+
+    def local_score(self, word: str) -> tuple[int, bool, int]:
+        is_dict = word in self.dict_words
+        dict_score = 40 if is_dict else 0
         
-        for _ in range(batch_size):
-            if available_words:
-                word = random.choice(available_words)
-                available_words.remove(word)
-            else:
-                letters = "abcdefghijklmnopqrstuvwxyz"
-                word = "".join(random.choices(letters, k=5))
-            
-            self.used_combinations.add(word)
-            batch.append(word)
-        return batch
-
-# ==========================================
-# 4. СИСТЕМА ОЦЕНКИ
-# ==========================================
-class Scorer:
-    def __init__(self, dictionary_words: set):
-        self.dictionary_words = dictionary_words
-
-    def check_readability(self, word: str) -> int:
-        vowels = set("aeiouy")
-        score = 30
+        read_score = 30
         for i in range(len(word) - 2):
             chunk = word[i:i+3]
-            v_count = sum(1 for c in chunk if c in vowels)
+            v_count = sum(1 for char in chunk if char in self.vowels)
             if v_count == 3 or v_count == 0:
-                score -= 15
-        return max(0, score)
+                read_score -= 15
+        read_score = max(0, read_score)
+        
+        return dict_score + read_score, is_dict, read_score
 
-    async def parse_fragment_value(self, word: str) -> int:
+    async def fragment_score(self, word: str) -> int:
         url = f"https://fragment.com/?query={word}"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=5) as response:
+                async with session.get(url, timeout=10) as response:
+                    if response.status != 200:
+                        return 0
                     html = await response.text()
                     soup = BeautifulSoup(html, 'html.parser')
+                    
                     price_elements = soup.find_all('div', class_='table-cell-value tm-value icon-before icon-ton')
-                    
-                    if not price_elements:
-                        return 0
-                    
                     prices = []
                     for el in price_elements:
                         match = re.search(r'([\d,]+)', el.text)
                         if match:
                             prices.append(int(match.group(1).replace(',', '')))
                     
-                    if prices:
-                        avg_price = sum(prices) / len(prices)
-                        if avg_price > 1000: return 30
-                        if avg_price > 500: return 20
-                        if avg_price > 100: return 10
+                    if not prices: return 0
+                    
+                    avg_price = sum(prices) / len(prices)
+                    if avg_price >= 500: return 30
+                    if avg_price >= 100: return 20
+                    if avg_price > 10: return 10
                     return 0
         except Exception as e:
-            logging.error(f"Fragment parse error: {e}")
+            logging.error(f"Ошибка Fragment: {e}")
             return 0
 
-    async def evaluate(self, username: str) -> Dict:
-        dict_score = 40 if username in self.dictionary_words else 0
-        read_score = self.check_readability(username)
-        frag_score = await self.parse_fragment_value(username)
-        
-        total = dict_score + read_score + frag_score
-        return {
-            "username": username,
-            "total_score": total,
-            "is_dict": dict_score > 0,
-            "readability": read_score,
-            "fragment_potential": frag_score
-        }
-
 # ==========================================
-# 5. TELETHON CHECKER (С жесткой защитой)
+# 4. РОТАЦИЯ СЕССИЙ (Multi-Session)
 # ==========================================
-class UserSessionChecker:
+class MultiSessionChecker:
     def __init__(self, api_id: int, api_hash: str):
-        self.client = TelegramClient('checker_session', api_id, api_hash)
+        self.clients = [
+            TelegramClient('checker_session_1', api_id, api_hash),
+            TelegramClient('checker_session_2', api_id, api_hash)
+        ]
+        self.current_idx = 0 
         
     async def start(self):
-        await self.client.start()
-        logging.info("Telethon клиент успешно авторизован.")
+        for i, client in enumerate(self.clients, 1):
+            logging.info(f"Запуск клиента {i}/2... (Следуй инструкциям в консоли)")
+            await client.start()
+            logging.info(f"✅ Telethon клиент {i} успешно авторизован.")
 
-    async def check_username(self, username: str) -> bool:
+    async def is_username_free(self, username: str) -> bool:
+        client = self.clients[self.current_idx]
+        active_client_num = self.current_idx + 1
+        self.current_idx = (self.current_idx + 1) % len(self.clients)
+        
         try:
-            result = await self.client(CheckUsernameRequest(username=username))
+            result = await client(CheckUsernameRequest(username=username))
             return result
         except FloodWaitError as e:
-            logging.warning(f"⚠️ FloodWait! Засыпаем на {e.seconds} сек.")
-            await asyncio.sleep(e.seconds + 5)
-            return await self.check_username(username)
+            wait_time = e.seconds + 10
+            logging.critical(f"🛑 FLOOD WAIT на клиенте {active_client_num}! Спим {wait_time} сек.")
+            await asyncio.sleep(wait_time)
+            return False 
         except UsernameInvalidError:
             return False
-        except RPCError as e:
-            logging.error(f"🛑 Telegram API заблокировал запрос (caused by CheckUsernameRequest): {e}")
-            logging.warning("Включаем аварийную паузу на 5 минут (300 секунд)...")
-            await asyncio.sleep(300) 
-            return False
         except Exception as e:
-            logging.error(f"Неизвестная ошибка проверки {username}: {e}")
+            logging.error(f"Ошибка MTProto [{username}] на клиенте {active_client_num}: {e}")
+            await asyncio.sleep(15)
             return False
 
 # ==========================================
-# 6. ИНТЕРФЕЙС И ЛОГИКА БОТА
+# 5. AIOGRAM: ИНТЕРФЕЙС
 # ==========================================
 router = Router()
-search_task: Optional[asyncio.Task] = None
+search_task = None
 
-def get_main_keyboard() -> InlineKeyboardMarkup:
+def get_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="▶️ Начать поиск", callback_data="start_search")],
-        [InlineKeyboardButton(text="⏸ Остановить поиск", callback_data="stop_search")],
-        [InlineKeyboardButton(text="📊 Рейтинг (Топ)", callback_data="show_top")]
+        [InlineKeyboardButton(text="▶️ Начать поиск", callback_data="start")],
+        [InlineKeyboardButton(text="⏸ Остановить поиск", callback_data="stop")],
+        [InlineKeyboardButton(text="📊 Рейтинг (Топ 10)", callback_data="top")]
     ])
 
-async def search_worker(checker: UserSessionChecker, generator: UsernameGenerator, scorer: Scorer, chat_id: int, bot: Bot):
+async def search_worker(checker: MultiSessionChecker, engine: Engine, bot: Bot, chat_id: int):
     try:
         while True:
-            batch = generator.get_next_batch(1)
-            username = batch[0]
+            word = engine.generate_word()
             
-            logging.info(f"Проверяю юзернейм: {username}...")
-            is_available = await checker.check_username(username)
+            loc_score, is_dict, read_score = engine.local_score(word)
+            if loc_score < MIN_LOCAL_SCORE:
+                continue 
+
+            logging.info(f"🔍 Проверка: @{word} (Лок. балл: {loc_score})")
+
+            is_free = await checker.is_username_free(word)
             
-            if is_available:
-                score_data = await scorer.evaluate(username)
+            if is_free:
+                frag_score = await engine.fragment_score(word)
+                total_score = loc_score + frag_score
                 
-                # Сохраняем в SQLite
-                await save_to_db(username, score_data['total_score'], score_data['is_dict'])
-                
-                msg = (f"🔥 <b>Найден свободный юзернейм:</b> @{username}\n"
-                       f"📊 Оценка: {score_data['total_score']}/100\n"
-                       f"Словарное: {'Да' if score_data['is_dict'] else 'Нет'}")
-                await bot.send_message(chat_id, msg)
-            
-            # Задержка 12 секунд для безопасности сессии
-            await asyncio.sleep(12) 
-            
+                await save_username(word, total_score, is_dict, read_score, frag_score)
+                msg = (f"🔥 <b>НАЙДЕН ЮЗЕРНЕЙМ:</b> @{word}\n"
+                       f"📊 Общий балл: <b>{total_score}/100</b>\n"
+                       f"📖 В словаре: {'Да' if is_dict else 'Нет'}\n"
+                       f"🗣 Читаемость: {read_score}/30\n"
+                       f"💎 Fragment: {frag_score}/30")
+                await bot.send_message(chat_id, msg, parse_mode="HTML")
+
+            await asyncio.sleep(WORKER_SLEEP)
+
     except asyncio.CancelledError:
-        logging.info("Поиск был принудительно остановлен.")
+        logging.info("Поиск принудительно остановлен.")
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    await message.answer(
-        "👋 Привет! Я сканер 5-буквенных юзернеймов.\n"
-        "Управление осуществляется кнопками ниже.",
-        reply_markup=get_main_keyboard()
-    )
-
-@router.callback_query(F.data == "start_search")
-async def process_start_search(callback: CallbackQuery, bot: Bot, checker: UserSessionChecker, generator: UsernameGenerator, scorer: Scorer):
-    global search_task
-    if search_task and not search_task.done():
-        await callback.answer("⏳ Поиск уже запущен!", show_alert=True)
+    global msg_lock
+    if message.text != "/start":
         return
-
-    search_task = asyncio.create_task(search_worker(checker, generator, scorer, callback.message.chat.id, bot))
-    await callback.message.edit_text("▶️ <b>Поиск запущен!</b>\nЯ уведомлю вас при нахождении свободных вариантов.", reply_markup=get_main_keyboard(), parse_mode="HTML")
-
-@router.callback_query(F.data == "stop_search")
-async def process_stop_search(callback: CallbackQuery):
-    global search_task
-    if search_task and not search_task.done():
-        search_task.cancel()
-        await callback.message.edit_text("⏸ <b>Поиск остановлен.</b>", reply_markup=get_main_keyboard(), parse_mode="HTML")
-    else:
-        await callback.answer("⚠️ Поиск не активен.", show_alert=True)
-
-@router.callback_query(F.data == "show_top")
-async def process_show_top(callback: CallbackQuery):
-    top_usernames = await get_top_from_db()
-    
-    if not top_usernames:
-        await callback.answer("🤷‍♂️ База данных пока пуста. Запустите поиск.", show_alert=True)
-        return
-    
-    text = "📊 <b>ТОП НАЙДЕННЫХ ЮЗЕРНЕЙМОВ (Из БД):</b>\n\n"
-    for i, item in enumerate(top_usernames[:15], 1):
-        dict_label = "📖" if item['is_dict'] else "🎲"
-        text += f"{i}. @{item['username']} — {item['total_score']} б. {dict_label}\n"
         
-    await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
+    async with msg_lock:
+        await message.answer(
+            "👋 Панель управления снайпером юзернеймов (Multi-Session).", 
+            reply_markup=get_keyboard()
+        )
+
+@router.callback_query(F.data == "start")
+async def start_search(cb: CallbackQuery, bot: Bot, checker: MultiSessionChecker, engine: Engine):
+    global search_task, msg_lock
+    async with msg_lock:
+        if search_task and not search_task.done():
+            return await cb.answer("⏳ Поиск уже идет!", show_alert=True)
+        
+        search_task = asyncio.create_task(search_worker(checker, engine, bot, cb.message.chat.id))
+        await cb.message.edit_text(
+            "▶️ <b>Поиск запущен!</b>\nНагрузка распределяется между 2 аккаунтами.", 
+            reply_markup=get_keyboard(), 
+            parse_mode="HTML"
+        )
+        await cb.answer()
+
+@router.callback_query(F.data == "stop")
+async def stop_search(cb: CallbackQuery):
+    global search_task, msg_lock
+    async with msg_lock:
+        if search_task and not search_task.done():
+            search_task.cancel()
+            await cb.message.edit_text("⏸ <b>Поиск остановлен.</b>", reply_markup=get_keyboard(), parse_mode="HTML")
+        else:
+            await cb.answer("Поиск не активен.", show_alert=True)
+        await cb.answer()
+
+@router.callback_query(F.data == "top")
+async def show_top(cb: CallbackQuery):
+    global msg_lock
+    async with msg_lock:
+        top_list = await get_top_10()
+        if not top_list:
+            return await cb.answer("База пока пуста. Запустите поиск.", show_alert=True)
+        
+        text = "📊 <b>ТОП-10 ЮЗЕРНЕЙМОВ:</b>\n\n"
+        for i, (username, score, is_dict) in enumerate(top_list, 1):
+            icon = "📖" if is_dict else "🎲"
+            text += f"{i}. @{username} — {score} баллов {icon}\n"
+            
+        await cb.message.edit_text(text, reply_markup=get_keyboard(), parse_mode="HTML")
+        await cb.answer()
 
 # ==========================================
-# 7. ТОЧКА ВХОДА
+# 6. ТОЧКА ВХОДА
 # ==========================================
 async def main():
+    global msg_lock
+    msg_lock = asyncio.Lock()  # Инициализация замка внутри Event Loop
+    
     await init_db()
     
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
     
-    checker = UserSessionChecker(API_ID, API_HASH)
-    generator = UsernameGenerator()
-    scorer = Scorer(generator.dictionary_words)
+    checker = MultiSessionChecker(API_ID, API_HASH)
+    engine = Engine()
     
-    dp.workflow_data.update({
-        "checker": checker,
-        "generator": generator,
-        "scorer": scorer,
-        "bot": bot
-    })
+    dp.workflow_data.update({"checker": checker, "engine": engine})
     
-    await checker.start()
+    await checker.start() 
     
-    logging.info("Бот и SQLite успешно запущены.")
+    print("✅ Бот готов к работе. Напиши /start в Telegram.")
+    
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
