@@ -27,7 +27,7 @@ API_ID = 33248398
 API_HASH = "6543087387b7b14fcafcca74d28b1158"
 
 MIN_LOCAL_SCORE = 30  
-WORKER_SLEEP = 30      
+WORKER_SLEEP = 20      
 
 # Автоматический выбор пути: Amvera (/data) или локальный Pydroid
 if os.path.exists("/data") and os.access("/data", os.W_OK):
