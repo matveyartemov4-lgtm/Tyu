@@ -20,7 +20,7 @@ from telethon.tl.functions.account import CheckUsernameRequest
 from telethon.errors import FloodWaitError, UsernameInvalidError
 
 # ==========================================
-# 1. КОНФИГУРАЦИЯ (Данные вставлены)
+# 1. КОНФИГУРАЦИЯ
 # ==========================================
 BOT_TOKEN = "8932397702:AAGY7wdLp4dy96MeSH1lce86HqzClmmMEqk"
 API_ID = 33248398
@@ -29,7 +29,6 @@ API_HASH = "6543087387b7b14fcafcca74d28b1158"
 MIN_LOCAL_SCORE = 30  
 WORKER_SLEEP = 20      
 
-# Автоматический выбор пути: Amvera (/data) или локальный Pydroid
 if os.path.exists("/data") and os.access("/data", os.W_OK):
     DB_PATH = "/data/usernames.db"
 else:
@@ -37,7 +36,6 @@ else:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Переменная для защиты от дублирования кнопок
 msg_lock = None 
 
 # ==========================================
@@ -58,6 +56,12 @@ async def init_db():
                 fragment_score INTEGER
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS favorites (
+                username TEXT PRIMARY KEY,
+                score INTEGER
+            )
+        """)
         await db.commit()
 
 async def save_username(username: str, score: int, is_dict: bool, read: int, frag: int):
@@ -70,6 +74,21 @@ async def save_username(username: str, score: int, is_dict: bool, read: int, fra
             await db.commit()
     except Exception as e:
         logging.error(f"Ошибка сохранения в БД: {e}")
+
+async def add_to_favorites(username: str, score: int):
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR IGNORE INTO favorites VALUES (?, ?)", (username, score))
+            await db.commit()
+            return True
+    except Exception as e:
+        logging.error(f"Ошибка добавления в избранное: {e}")
+        return False
+
+async def get_favorites():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT username, score FROM favorites LIMIT 30") as cursor:
+            return await cursor.fetchall()
 
 async def get_top_10():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -136,8 +155,9 @@ class Engine:
         except Exception as e:
             logging.error(f"Ошибка Fragment: {e}")
             return 0
+
 # ==========================================
-# 4. РОТАЦИЯ СЕССИЙ (Multi-Session)
+# 4. РОТАЦИЯ СЕССИЙ + ИНТЕГРАЦИЯ С USERATE_BOT
 # ==========================================
 class MultiSessionChecker:
     def __init__(self, api_id: int, api_hash: str):
@@ -149,7 +169,7 @@ class MultiSessionChecker:
         
     async def start(self):
         for i, client in enumerate(self.clients, 1):
-            logging.info(f"Запуск клиента {i}/2... (Следуй инструкциям в консоли)")
+            logging.info(f"Запуск клиента {i}/2...")
             await client.start()
             logging.info(f"✅ Telethon клиент {i} успешно авторизован.")
 
@@ -158,19 +178,49 @@ class MultiSessionChecker:
         self.current_idx = (self.current_idx + 1) % len(self.clients)
         
         try:
-            # Используем метод проверки
             result = await client(CheckUsernameRequest(username=username))
             return result
         except FloodWaitError as e:
             await asyncio.sleep(e.seconds)
             return False
         except Exception:
-            # Теперь бот не будет забивать логи ошибками, а просто пропустит имя
             return False
-            
 
-
+    async def get_external_data(self, username: str) -> tuple[str, str]:
+        """Отправляет юзернейм боту @UserRate_bot и возвращает (ранг, потенциал)"""
+        client = self.clients[self.current_idx]
+        target_bot = "@UserRate_bot"
+        rank_info = "Не найден"
+        potential_info = "Не найден"
+        
+        try:
+            await client.send_message(target_bot, f"@{username}")
+            await asyncio.sleep(2.5) # Время на ответ бота
             
+            messages = await client.get_messages(target_bot, limit=1)
+            if messages:
+                text = messages[0].text
+                lines = text.split("\n")
+                
+                for line in lines:
+                    line_lower = line.lower()
+                    # Ищем строку с рангом
+                    if "ранг" in line_lower or "rank" in line_lower:
+                        rank_info = line.strip()
+                    # Ищем строку с потенциалом
+                    elif "потенциал" in line_lower or "potential" in line_lower:
+                        potential_info = line.strip()
+                
+                # Если бот прислал текст, но явных ключевых слов нет, берем первые строки
+                if rank_info == "Не найден" and potential_info == "Не найден" and lines:
+                    rank_info = lines[0].strip()
+                    potential_info = lines[1].strip() if len(lines) > 1 else "Не определен"
+                    
+            return rank_info, potential_info
+        except Exception as e:
+            logging.error(f"Ошибка при работе с @UserRate_bot: {e}")
+            return "Ошибка запроса", "Ошибка запроса"
+
 # ==========================================
 # 5. AIOGRAM: ИНТЕРФЕЙС
 # ==========================================
@@ -181,7 +231,12 @@ def get_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Начать поиск", callback_data="start")],
         [InlineKeyboardButton(text="⏸ Остановить поиск", callback_data="stop")],
-        [InlineKeyboardButton(text="📊 Рейтинг (Топ 10)", callback_data="top")]
+        [InlineKeyboardButton(text="📊 Топ-10", callback_data="top"), InlineKeyboardButton(text="⭐ Избранное", callback_data="view_favs")]
+    ])
+
+def get_found_keyboard(username: str, score: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Добавить в избранное", callback_data=f"fav_{username}_{score}")]
     ])
 
 async def search_worker(checker: MultiSessionChecker, engine: Engine, bot: Bot, chat_id: int):
@@ -202,12 +257,20 @@ async def search_worker(checker: MultiSessionChecker, engine: Engine, bot: Bot, 
                 total_score = loc_score + frag_score
                 
                 await save_username(word, total_score, is_dict, read_score, frag_score)
-                msg = (f"🔥 <b>НАЙДЕН ЮЗЕРНЕЙМ:</b> @{word}\n"
-                       f"📊 Общий балл: <b>{total_score}/100</b>\n"
+                
+                # Получаем ранг и потенциал одновременно
+                rank, potential = await checker.get_external_data(word)
+                
+                msg = (f"🔥 <b>НАЙДЕН ЮЗЕРНЕЙМ:</b> @{word}\n\n"
+                       f"📊 Наш общий балл: <b>{total_score}/100</b>\n"
                        f"📖 В словаре: {'Да' if is_dict else 'Нет'}\n"
                        f"🗣 Читаемость: {read_score}/30\n"
-                       f"💎 Fragment: {frag_score}/30")
-                await bot.send_message(chat_id, msg, parse_mode="HTML")
+                       f"💎 Fragment: {frag_score}/30\n\n"
+                       f"👑 <b>Данные @UserRate_bot:</b>\n"
+                       f"🔹 {rank}\n"
+                       f"⚡ {potential}")
+                
+                await bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=get_found_keyboard(word, total_score))
 
             await asyncio.sleep(WORKER_SLEEP)
 
@@ -222,7 +285,7 @@ async def cmd_start(message: Message):
         
     async with msg_lock:
         await message.answer(
-            "👋 Панель управления снайпером юзернеймов (Multi-Session).", 
+            "👋 Панель управления снайпером юзернеймов (Парсинг Ранга + Потенциала активен).", 
             reply_markup=get_keyboard()
         )
 
@@ -235,7 +298,7 @@ async def start_search(cb: CallbackQuery, bot: Bot, checker: MultiSessionChecker
         
         search_task = asyncio.create_task(search_worker(checker, engine, bot, cb.message.chat.id))
         await cb.message.edit_text(
-            "▶️ <b>Поиск запущен!</b>\nНагрузка распределяется между 2 аккаунтами.", 
+            "▶️ <b>Поиск запущен!</b>\nПроверка идет через 2 сессии + выгрузка аналитики @UserRate_bot.", 
             reply_markup=get_keyboard(), 
             parse_mode="HTML"
         )
@@ -268,12 +331,40 @@ async def show_top(cb: CallbackQuery):
         await cb.message.edit_text(text, reply_markup=get_keyboard(), parse_mode="HTML")
         await cb.answer()
 
+@router.callback_query(F.data.startswith("fav_"))
+async def handle_add_favorite(cb: CallbackQuery):
+    parts = cb.data.split("_")
+    username = parts[1]
+    score = int(parts[2])
+    
+    success = await add_to_favorites(username, score)
+    if success:
+        await cb.answer(f"⭐ @{username} добавлен в Избранное!", show_alert=False)
+        await cb.message.edit_reply_markup(reply_markup=None)
+    else:
+        await cb.answer("Ошибка при сохранении.", show_alert=True)
+
+@router.callback_query(F.data == "view_favs")
+async def show_favorites(cb: CallbackQuery):
+    global msg_lock
+    async with msg_lock:
+        favs = await get_favorites()
+        if not favs:
+            return await cb.answer("Список избранного пуст.", show_alert=True)
+        
+        text = "⭐ <b>ВАШЕ ИЗБРАННОЕ:</b>\n\n"
+        for i, (username, score) in enumerate(favs, 1):
+            text += f"{i}. @{username} (Балл: {score})\n"
+            
+        await cb.message.edit_text(text, reply_markup=get_keyboard(), parse_mode="HTML")
+        await cb.answer()
+
 # ==========================================
 # 6. ТОЧКА ВХОДА
 # ==========================================
 async def main():
     global msg_lock
-    msg_lock = asyncio.Lock()  # Инициализация замка внутри Event Loop
+    msg_lock = asyncio.Lock()  
     
     await init_db()
     
@@ -295,3 +386,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+            
