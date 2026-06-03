@@ -155,7 +155,6 @@ class Engine:
         except Exception as e:
             logging.error(f"Ошибка Fragment: {e}")
             return 0
-
 # ==========================================
 # 4. РОТАЦИЯ СЕССИЙ + ИНТЕГРАЦИЯ С USERATE_BOT
 # ==========================================
@@ -166,6 +165,7 @@ class MultiSessionChecker:
             TelegramClient('checker_session_2', api_id, api_hash)
         ]
         self.current_idx = 0 
+        self.last_userrate_call = 0  # ⏱ Переменная для таймера лимитов
         
     async def start(self):
         for i, client in enumerate(self.clients, 1):
@@ -178,7 +178,6 @@ class MultiSessionChecker:
         self.current_idx = (self.current_idx + 1) % len(self.clients)
         
         try:
-            # Предотвращаем зависание запроса таймаутом
             result = await asyncio.wait_for(client(CheckUsernameRequest(username=username)), timeout=7.0)
             return result
         except asyncio.TimeoutError:
@@ -192,13 +191,25 @@ class MultiSessionChecker:
             return False
 
     async def get_external_data(self, username: str) -> tuple[str, str]:
-        """Безопасная выгрузка данных из @UserRate_bot с защитой от Deadlock"""
+        """Безопасная выгрузка данных из @UserRate_bot с учетом лимита в 45 секунд"""
+        
+        # 🛡 Защита от лимита в 45 секунд
+        now = time.time()
+        time_passed = now - self.last_userrate_call
+        if time_passed < 45.0:
+            wait_time = 45.0 - time_passed
+            logging.info(f"⏳ Ожидание {wait_time:.1f} сек. из-за ограничений @UserRate_bot...")
+            await asyncio.sleep(wait_time)
+            
+        # Обновляем время последнего запроса
+        self.last_userrate_call = time.time()
+        
         client = self.clients[self.current_idx]
         target_bot = "@UserRate_bot"
         
         async def _fetch():
             await client.send_message(target_bot, f"@{username}")
-            await asyncio.sleep(3.0)  # Даем боту гарантированное время на ответ
+            await asyncio.sleep(3.0)  
             messages = await client.get_messages(target_bot, limit=1)
             if messages:
                 text = messages[0].text
@@ -222,7 +233,7 @@ class MultiSessionChecker:
         except Exception:
             return "Таймаут получения ранга", "Таймаут получения потенциала"
 
-# ==========================================
+# =====================================
 # 5. AIOGRAM: ИНТЕРФЕЙС
 # ==========================================
 router = Router()
