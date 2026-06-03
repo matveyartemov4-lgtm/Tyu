@@ -1,5 +1,5 @@
 aiogram
-telethon>=2.0.0a1
+git+https://github.com/LonamiWebs/Telethon.git
 aiohttp
 aiosqlite
 beautifulsoup4
