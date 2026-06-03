@@ -27,7 +27,7 @@ API_ID = 33248398
 API_HASH = "6543087387b7b14fcafcca74d28b1158"
 
 MIN_LOCAL_SCORE = 30  
-WORKER_SLEEP = 20      
+WORKER_SLEEP = 15      # Безопасный интервал между проверками (15 секунд)
 
 if os.path.exists("/data") and os.access("/data", os.W_OK):
     DB_PATH = "/data/usernames.db"
@@ -178,48 +178,49 @@ class MultiSessionChecker:
         self.current_idx = (self.current_idx + 1) % len(self.clients)
         
         try:
-            result = await client(CheckUsernameRequest(username=username))
+            # Предотвращаем зависание запроса таймаутом
+            result = await asyncio.wait_for(client(CheckUsernameRequest(username=username)), timeout=7.0)
             return result
+        except asyncio.TimeoutError:
+            logging.warning(f"⏰ Таймаут проверки Telegram для @{username}. Пропуск.")
+            return False
         except FloodWaitError as e:
+            logging.warning(f"⚠️ FloodWait: Пауза {e.seconds} сек.")
             await asyncio.sleep(e.seconds)
             return False
         except Exception:
             return False
 
     async def get_external_data(self, username: str) -> tuple[str, str]:
-        """Отправляет юзернейм боту @UserRate_bot и возвращает (ранг, потенциал)"""
+        """Безопасная выгрузка данных из @UserRate_bot с защитой от Deadlock"""
         client = self.clients[self.current_idx]
         target_bot = "@UserRate_bot"
-        rank_info = "Не найден"
-        potential_info = "Не найден"
         
-        try:
+        async def _fetch():
             await client.send_message(target_bot, f"@{username}")
-            await asyncio.sleep(2.5) # Время на ответ бота
-            
+            await asyncio.sleep(3.0)  # Даем боту гарантированное время на ответ
             messages = await client.get_messages(target_bot, limit=1)
             if messages:
                 text = messages[0].text
                 lines = text.split("\n")
-                
+                rank_info = "Не найден"
+                potential_info = "Не найден"
                 for line in lines:
                     line_lower = line.lower()
-                    # Ищем строку с рангом
                     if "ранг" in line_lower or "rank" in line_lower:
                         rank_info = line.strip()
-                    # Ищем строку с потенциалом
                     elif "потенциал" in line_lower or "potential" in line_lower:
                         potential_info = line.strip()
-                
-                # Если бот прислал текст, но явных ключевых слов нет, берем первые строки
                 if rank_info == "Не найден" and potential_info == "Не найден" and lines:
                     rank_info = lines[0].strip()
                     potential_info = lines[1].strip() if len(lines) > 1 else "Не определен"
-                    
-            return rank_info, potential_info
-        except Exception as e:
-            logging.error(f"Ошибка при работе с @UserRate_bot: {e}")
-            return "Ошибка запроса", "Ошибка запроса"
+                return rank_info, potential_info
+            return "Нет ответа от бота", "Нет ответа от бота"
+
+        try:
+            return await asyncio.wait_for(_fetch(), timeout=8.0)
+        except Exception:
+            return "Таймаут получения ранга", "Таймаут получения потенциала"
 
 # ==========================================
 # 5. AIOGRAM: ИНТЕРФЕЙС
@@ -244,21 +245,25 @@ async def search_worker(checker: MultiSessionChecker, engine: Engine, bot: Bot, 
         while True:
             word = engine.generate_word()
             
+            # Логируем АБСОЛЮТНО ВСЕ проверяемые имена, чтобы ты видел, что бот живой
+            logging.info(f"🔍 Проверка юзернейма: @{word}")
+
             loc_score, is_dict, read_score = engine.local_score(word)
             if loc_score < MIN_LOCAL_SCORE:
+                logging.info(f"   ↳ Пропущен локально (Низкий балл: {loc_score})")
+                await asyncio.sleep(WORKER_SLEEP)
                 continue 
-
-            logging.info(f"🔍 Проверка: @{word} (Лок. балл: {loc_score})")
 
             is_free = await checker.is_username_free(word)
             
             if is_free:
+                logging.info(f"🔥 Найдено свободное имя: @{word}! Запрашиваем внешнюю аналитику...")
                 frag_score = await engine.fragment_score(word)
                 total_score = loc_score + frag_score
                 
                 await save_username(word, total_score, is_dict, read_score, frag_score)
                 
-                # Получаем ранг и потенциал одновременно
+                # Пишет в чат @UserRate_bot ТОЛЬКО здесь, при реальной находке!
                 rank, potential = await checker.get_external_data(word)
                 
                 msg = (f"🔥 <b>НАЙДЕН ЮЗЕРНЕЙМ:</b> @{word}\n\n"
@@ -271,6 +276,8 @@ async def search_worker(checker: MultiSessionChecker, engine: Engine, bot: Bot, 
                        f"⚡ {potential}")
                 
                 await bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=get_found_keyboard(word, total_score))
+            else:
+                logging.info(f"   ↳ Юзернейм @{word} занят в Telegram.")
 
             await asyncio.sleep(WORKER_SLEEP)
 
@@ -285,7 +292,7 @@ async def cmd_start(message: Message):
         
     async with msg_lock:
         await message.answer(
-            "👋 Панель управления снайпером юзернеймов (Парсинг Ранга + Потенциала активен).", 
+            "👋 Панель управления снайпером юзернеймов (Логирование 100% активности включено).", 
             reply_markup=get_keyboard()
         )
 
@@ -298,7 +305,7 @@ async def start_search(cb: CallbackQuery, bot: Bot, checker: MultiSessionChecker
         
         search_task = asyncio.create_task(search_worker(checker, engine, bot, cb.message.chat.id))
         await cb.message.edit_text(
-            "▶️ <b>Поиск запущен!</b>\nПроверка идет через 2 сессии + выгрузка аналитики @UserRate_bot.", 
+            "▶️ <b>Поиск запущен!</b>\nСледи за обновлением логов каждые 15 секунд.", 
             reply_markup=get_keyboard(), 
             parse_mode="HTML"
         )
@@ -386,4 +393,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-            
+                
