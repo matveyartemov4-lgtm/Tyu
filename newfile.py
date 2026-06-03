@@ -156,6 +156,7 @@ class Engine:
         except Exception as e:
             logging.error(f"Ошибка Fragment: {e}")
             return 0
+
 # ==========================================
 # 4. РОТАЦИЯ СЕССИЙ + ИНТЕГРАЦИЯ С USERATE_BOT
 # ==========================================
@@ -166,7 +167,7 @@ class MultiSessionChecker:
             TelegramClient('checker_session_2', api_id, api_hash)
         ]
         self.current_idx = 0 
-        self.last_userrate_call = 0  # ⏱ Переменная для таймера лимитов
+        self.last_userrate_call = 0  
         
     async def start(self):
         for i, client in enumerate(self.clients, 1):
@@ -192,7 +193,7 @@ class MultiSessionChecker:
             return False
 
     async def get_external_data(self, username: str) -> tuple[str, str]:
-        """Безопасная выгрузка данных из @UserRate_bot с учетом лимита в 45 секунд"""
+        """Безопасная выгрузка данных из @UserRate_bot с ожиданием 15 секунд"""
         
         # 🛡 Защита от лимита в 45 секунд
         now = time.time()
@@ -202,37 +203,68 @@ class MultiSessionChecker:
             logging.info(f"⏳ Ожидание {wait_time:.1f} сек. из-за ограничений @UserRate_bot...")
             await asyncio.sleep(wait_time)
             
-        # Обновляем время последнего запроса
         self.last_userrate_call = time.time()
         
         client = self.clients[self.current_idx]
         target_bot = "@UserRate_bot"
         
         async def _fetch():
+            # Отправляем сообщение
             await client.send_message(target_bot, f"@{username}")
-            await asyncio.sleep(3.0)  
-            messages = await client.get_messages(target_bot, limit=1)
+            logging.info(f"📤 Юзернейм @{username} отправлен @UserRate_bot. Ждем 15 секунд...")
+            
+            # ЖДЕМ РОВНО 15 СЕКУНД перед тем как забирать ответ
+            await asyncio.sleep(15.0)  
+            
+            # Берем 5 последних сообщений из чата, чтобы точно захватить ответ бота
+            messages = await client.get_messages(target_bot, limit=5)
+            
+            rank_info = "Не найден"
+            potential_info = "Не найден"
+            
             if messages:
-                text = messages[0].text
-                lines = text.split("\n")
-                rank_info = "Не найден"
-                potential_info = "Не найден"
-                for line in lines:
-                    line_lower = line.lower()
-                    if "ранг" in line_lower or "rank" in line_lower:
-                        rank_info = line.strip()
-                    elif "потенциал" in line_lower or "potential" in line_lower:
-                        potential_info = line.strip()
-                if rank_info == "Не найден" and potential_info == "Не найден" and lines:
-                    rank_info = lines[0].strip()
-                    potential_info = lines[1].strip() if len(lines) > 1 else "Не определен"
-                return rank_info, potential_info
-            return "Нет ответа от бота", "Нет ответа от бота"
+                for message in messages:
+                    # Пропускаем пустые сообщения и наши собственные исходящие
+                    if not message.text or message.out:
+                        continue
+                        
+                    text = message.text
+                    lines = text.split("\n")
+                    
+                    found_keywords = False
+                    for line in lines:
+                        line_lower = line.lower()
+                        if "ранг" in line_lower or "rank" in line_lower:
+                            rank_info = line.strip()
+                            found_keywords = True
+                        elif "потенциал" in line_lower or "potential" in line_lower:
+                            potential_info = line.strip()
+                            found_keywords = True
+                    
+                    # Если нашли нужные слова в этом сообщении, прекращаем поиск
+                    if found_keywords:
+                        break
+                        
+                # Резервный вариант, если бот прислал текст без ключевых слов
+                if rank_info == "Не найден" and potential_info == "Не найден":
+                    for message in messages:
+                        if not message.out and message.text:
+                            lines = message.text.split("\n")
+                            rank_info = lines[0].strip()
+                            potential_info = lines[1].strip() if len(lines) > 1 else "Не определен"
+                            break
+
+            return rank_info, potential_info
 
         try:
-            return await asyncio.wait_for(_fetch(), timeout=8.0)
-        except Exception:
-            return "Таймаут получения ранга", "Таймаут получения потенциала"
+            # Увеличен таймаут до 25 секунд (15 секунд сна + 10 на запросы)
+            return await asyncio.wait_for(_fetch(), timeout=25.0)
+        except asyncio.TimeoutError:
+            logging.error(f"⏰ @UserRate_bot не ответил на @{username} в течение 25 секунд.")
+            return "Таймаут (Нет ответа)", "Таймаут (Нет ответа)"
+        except Exception as e:
+            logging.error(f"❌ Ошибка парсинга @UserRate_bot: {e}")
+            return "Ошибка", "Ошибка"
 
 # =====================================
 # 5. AIOGRAM: ИНТЕРФЕЙС
@@ -257,7 +289,6 @@ async def search_worker(checker: MultiSessionChecker, engine: Engine, bot: Bot, 
         while True:
             word = engine.generate_word()
             
-            # Логируем АБСОЛЮТНО ВСЕ проверяемые имена, чтобы ты видел, что бот живой
             logging.info(f"🔍 Проверка юзернейма: @{word}")
 
             loc_score, is_dict, read_score = engine.local_score(word)
@@ -275,7 +306,7 @@ async def search_worker(checker: MultiSessionChecker, engine: Engine, bot: Bot, 
                 
                 await save_username(word, total_score, is_dict, read_score, frag_score)
                 
-                # Пишет в чат @UserRate_bot ТОЛЬКО здесь, при реальной находке!
+                # Запрос к боту с улучшенной отправкой и ожиданием 15 сек
                 rank, potential = await checker.get_external_data(word)
                 
                 msg = (f"🔥 <b>НАЙДЕН ЮЗЕРНЕЙМ:</b> @{word}\n\n"
@@ -405,4 +436,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-                
+    
