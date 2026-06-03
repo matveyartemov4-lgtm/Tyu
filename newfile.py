@@ -15,6 +15,7 @@ from english_words import get_english_words_set
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart
+from aiogram.client.default import DefaultBotProperties
 
 from telethon import TelegramClient
 from telethon.tl.functions.account import CheckUsernameRequest
@@ -28,7 +29,7 @@ API_ID = 33248398
 API_HASH = "6543087387b7b14fcafcca74d28b1158"
 
 MIN_LOCAL_SCORE = 30  
-WORKER_SLEEP = 15      # Безопасный интервал между проверками (15 секунд)
+WORKER_SLEEP = 15      
 
 if os.path.exists("/data") and os.access("/data", os.W_OK):
     DB_PATH = "/data/usernames.db"
@@ -74,7 +75,7 @@ async def save_username(username: str, score: int, is_dict: bool, read: int, fra
             )
             await db.commit()
     except Exception as e:
-        logging.error(f"Ошибка сохранения в БД: {e}")
+        logging.error(f"Ошибка保存 в БД: {e}")
 
 async def add_to_favorites(username: str, score: int):
     try:
@@ -194,8 +195,6 @@ class MultiSessionChecker:
 
     async def get_external_data(self, username: str) -> tuple[str, str]:
         """Безопасная выгрузка данных из @UserRate_bot с ожиданием 15 секунд"""
-        
-        # 🛡 Защита от лимита в 45 секунд
         now = time.time()
         time_passed = now - self.last_userrate_call
         if time_passed < 45.0:
@@ -209,28 +208,22 @@ class MultiSessionChecker:
         target_bot = "@UserRate_bot"
         
         async def _fetch():
-            # Отправляем сообщение
             await client.send_message(target_bot, f"@{username}")
             logging.info(f"📤 Юзернейм @{username} отправлен @UserRate_bot. Ждем 15 секунд...")
             
-            # ЖДЕМ РОВНО 15 СЕКУНД перед тем как забирать ответ
             await asyncio.sleep(15.0)  
             
-            # Берем 5 последних сообщений из чата, чтобы точно захватить ответ бота
             messages = await client.get_messages(target_bot, limit=5)
-            
             rank_info = "Не найден"
             potential_info = "Не найден"
             
             if messages:
                 for message in messages:
-                    # Пропускаем пустые сообщения и наши собственные исходящие
                     if not message.text or message.out:
                         continue
                         
                     text = message.text
                     lines = text.split("\n")
-                    
                     found_keywords = False
                     for line in lines:
                         line_lower = line.lower()
@@ -240,12 +233,9 @@ class MultiSessionChecker:
                         elif "потенциал" in line_lower or "potential" in line_lower:
                             potential_info = line.strip()
                             found_keywords = True
-                    
-                    # Если нашли нужные слова в этом сообщении, прекращаем поиск
                     if found_keywords:
                         break
                         
-                # Резервный вариант, если бот прислал текст без ключевых слов
                 if rank_info == "Не найден" and potential_info == "Не найден":
                     for message in messages:
                         if not message.out and message.text:
@@ -257,7 +247,6 @@ class MultiSessionChecker:
             return rank_info, potential_info
 
         try:
-            # Увеличен таймаут до 25 секунд (15 секунд сна + 10 на запросы)
             return await asyncio.wait_for(_fetch(), timeout=25.0)
         except asyncio.TimeoutError:
             logging.error(f"⏰ @UserRate_bot не ответил на @{username} в течение 25 секунд.")
@@ -267,7 +256,7 @@ class MultiSessionChecker:
             return "Ошибка", "Ошибка"
 
 # =====================================
-# 5. AIOGRAM: ИНТЕРФЕЙС
+# 5. AIOGRAM: ИНТЕРФЕЙС И ФОНОВЫЙ ПРОЦЕСС
 # ==========================================
 router = Router()
 search_task = None
@@ -284,11 +273,35 @@ def get_found_keyboard(username: str, score: int):
         [InlineKeyboardButton(text="⭐ Добавить в избранное", callback_data=f"fav_{username}_{score}")]
     ])
 
+async def process_free_username(word, loc_score, is_dict, read_score, checker, engine, bot, chat_id):
+    """Отдельный изолированный фоновый подпроцесс обработки свободной находки"""
+    try:
+        logging.info(f"🔥 Найдено свободное имя: @{word}! Запрашиваем внешнюю аналитику...")
+        frag_score = await engine.fragment_score(word)
+        total_score = loc_score + frag_score
+        
+        await save_username(word, total_score, is_dict, read_score, frag_score)
+        
+        # 15 секунд ожидания происходят здесь, изолированно от основного aiogram-цикла
+        rank, potential = await checker.get_external_data(word)
+        
+        msg = (f"🔥 <b>НАЙДЕН ЮЗЕРНЕЙМ:</b> @{word}\n\n"
+               f"📊 Наш общий балл: <b>{total_score}/100</b>\n"
+               f"📖 В словаре: {'Да' if is_dict else 'Нет'}\n"
+               f"🗣 Читаемость: {read_score}/30\n"
+               f"💎 Fragment: {frag_score}/30\n\n"
+               f"👑 <b>Данные @UserRate_bot:</b>\n"
+               f"🔹 {rank}\n"
+               f"⚡ {potential}")
+        
+        await bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=get_found_keyboard(word, total_score))
+    except Exception as e:
+        logging.error(f"Ошибка в фоновом процессоре имени @{word}: {e}")
+
 async def search_worker(checker: MultiSessionChecker, engine: Engine, bot: Bot, chat_id: int):
     try:
         while True:
             word = engine.generate_word()
-            
             logging.info(f"🔍 Проверка юзернейма: @{word}")
 
             loc_score, is_dict, read_score = engine.local_score(word)
@@ -300,25 +313,11 @@ async def search_worker(checker: MultiSessionChecker, engine: Engine, bot: Bot, 
             is_free = await checker.is_username_free(word)
             
             if is_free:
-                logging.info(f"🔥 Найдено свободное имя: @{word}! Запрашиваем внешнюю аналитику...")
-                frag_score = await engine.fragment_score(word)
-                total_score = loc_score + frag_score
-                
-                await save_username(word, total_score, is_dict, read_score, frag_score)
-                
-                # Запрос к боту с улучшенной отправкой и ожиданием 15 сек
-                rank, potential = await checker.get_external_data(word)
-                
-                msg = (f"🔥 <b>НАЙДЕН ЮЗЕРНЕЙМ:</b> @{word}\n\n"
-                       f"📊 Наш общий балл: <b>{total_score}/100</b>\n"
-                       f"📖 В словаре: {'Да' if is_dict else 'Нет'}\n"
-                       f"🗣 Читаемость: {read_score}/30\n"
-                       f"💎 Fragment: {frag_score}/30\n\n"
-                       f"👑 <b>Данные @UserRate_bot:</b>\n"
-                       f"🔹 {rank}\n"
-                       f"⚡ {potential}")
-                
-                await bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=get_found_keyboard(word, total_score))
+                # 💥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Запускаем обработку как фоновую задачу asyncio,
+                # чтобы основной цикл генерации и проверки не вешал aiogram сетевыми паузами.
+                asyncio.create_task(
+                    process_free_username(word, loc_score, is_dict, read_score, checker, engine, bot, chat_id)
+                )
             else:
                 logging.info(f"   ↳ Юзернейм @{word} занят в Telegram.")
 
@@ -335,7 +334,7 @@ async def cmd_start(message: Message):
         
     async with msg_lock:
         await message.answer(
-            "👋 Панель управления снайпером юзернеймов (Логирование 100% активности включено).", 
+            "👋 Панель управления снайпером юзернеймов (Защита от сетевых таймаутов добавлена).", 
             reply_markup=get_keyboard()
         )
 
@@ -350,6 +349,7 @@ async def start_search(cb: CallbackQuery, bot: Bot, checker: MultiSessionChecker
         await cb.message.edit_text(
             "▶️ <b>Поиск запущен!</b>\nСледи за обновлением логов каждые 15 секунд.", 
             reply_markup=get_keyboard(), 
+            get_keyboard=True,
             parse_mode="HTML"
         )
         await cb.answer()
@@ -418,7 +418,10 @@ async def main():
     
     await init_db()
     
-    bot = Bot(token=BOT_TOKEN)
+    # Задаем дефолтные проперти и увеличиваем внутренние таймауты сетевой сессии aiogram
+    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60, connect=15))
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(), session=None) 
+    
     dp = Dispatcher()
     dp.include_router(router)
     
@@ -432,8 +435,10 @@ async def main():
     print("✅ Бот готов к работе. Напиши /start в Telegram.")
     
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    
+    # Включаем мягкий режим пуллинга, игнорирующий сетевые отвалы
+    await dp.start_polling(bot, handle_as_tasks=True, relaxation=0.5)
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+                        
