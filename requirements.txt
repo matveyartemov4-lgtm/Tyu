@@ -1,6 +1,6 @@
 aiogram
-telethon
+git+https://github.com/LonamiWebs/Telethon.git
 aiohttp
-beautifulsoup4
 aiosqlite
+beautifulsoup4
 english-words
