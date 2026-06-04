@@ -480,10 +480,11 @@ async def main():
     msg_lock = asyncio.Lock()  
     
     await init_db()
-    
+        # Измени вот этот фрагмент:
     session = AiohttpSession(
-        timeout=aiohttp.ClientTimeout(total=60, connect=20, sock_read=20)
+        timeout=aiohttp.ClientTimeout(total=60)
     )
+
     
     bot = Bot(
         token=BOT_TOKEN, 
