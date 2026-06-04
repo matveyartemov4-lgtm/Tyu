@@ -481,10 +481,7 @@ async def main():
     
     await init_db()
         # Измени вот этот фрагмент:
-    session = AiohttpSession(
-        timeout=aiohttp.ClientTimeout(total=60)
-    )
-
+    session = AiohttpSession()
     
     bot = Bot(
         token=BOT_TOKEN, 
