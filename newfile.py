@@ -166,39 +166,38 @@ class Engine:
         read_score = max(0, read_score)
         
         return dict_score + read_score, is_dict, read_score
-
-    async def fragment_score(self, word: str) -> tuple[int, str]:
-        """Теперь возвращает кортеж: (Балл_Fragment, Примерная_Цена_Строкой)"""
-        url = f"https://fragment.com/?query={word}"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as response:
-                    if response.status != 200:
-                        return 0, "Нет данных"
-                    html = await response.text()
-                    soup = BeautifulSoup(html, 'html.parser')
-                    
-                    price_elements = soup.find_all('div', class_='table-cell-value tm-value icon-before icon-ton')
-                    prices = []
-                    for el in price_elements:
-                        match = re.search(r'([\d,]+)', el.text)
-                        if match:
-                            prices.append(int(match.group(1).replace(',', '')))
-                    
-                    if not prices: 
-                        return 0, "Нет данных"
-                    
-                    avg_price = sum(prices) // len(prices)
-                    
-                    # Оценка баллов на основе цены
-                    if avg_price >= 500: return 30, f"~{avg_price} TON"
-                    if avg_price >= 100: return 20, f"~{avg_price} TON"
-                    if avg_price > 10: return 10, f"~{avg_price} TON"
-                    
-                    return 0, f"~{avg_price} TON (Дешево)"
-        except Exception as e:
-            logging.error(f"Ошибка Fragment: {e}")
-            return 0, "Ошибка API"
+   async def fragment_score(self, word: str) -> tuple[int, str]:
+    """Теперь возвращает кортеж: (Балл_Fragment, Примерная_Цена_Строкой)"""
+    url = f"https://fragment.com/?query={word}"
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)  # ← ИСПРАВЛЕНО
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=timeout) as response:
+                if response.status != 200:
+                    return 0, "Нет данных"
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                
+                price_elements = soup.find_all('div', class_='table-cell-value tm-value icon-before icon-ton')
+                prices = []
+                for el in price_elements:
+                    match = re.search(r'([\d,]+)', el.text)
+                    if match:
+                        prices.append(int(match.group(1).replace(',', '')))
+                
+                if not prices: 
+                    return 0, "Нет данных"
+                
+                avg_price = sum(prices) // len(prices)
+                
+                if avg_price >= 500: return 30, f"~{avg_price} TON"
+                if avg_price >= 100: return 20, f"~{avg_price} TON"
+                if avg_price > 10:   return 10, f"~{avg_price} TON"
+                
+                return 0, f"~{avg_price} TON (Дешево)"
+    except Exception as e:
+        logging.error(f"Ошибка Fragment: {e}")
+        return 0, "Ошибка API"
 
 # ==========================================
 # 4. РОТАЦИЯ СЕССИЙ + ИНТЕГРАЦИЯ С USERATE_BOT
