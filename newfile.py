@@ -1,6 +1,3 @@
-#Смотри,добавь в код чтобы бот искал ещё и 6ти и 7ми и 8ми  символьные юзернеймы,однако эти 6ти и 7ми и 8ми символьные юзернеймы были с оценкой более 60(60 и больше для 6,80 и больше для 7 и 8),так же чтобы были кнопки старта, остановки и топа вместо клавиатуры,а также добавь примерную оценку юзернейма в Ton,на основе похожих юзов на фрагмент 
-print("⏳ Скрипт запускается... Загрузка библиотек (это может занять 10-20 секунд).")
-
 import asyncio
 import logging
 import random
@@ -17,6 +14,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 
 from telethon import TelegramClient
 from telethon.tl.functions.account import CheckUsernameRequest
@@ -40,6 +38,16 @@ else:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 msg_lock = None 
+
+def estimate_ton_price(username: str) -> str:
+    """Примерная оценка стоимости в TON на основе длины"""
+    length = len(username)
+    if length == 4: return "~1000 TON"
+    if length == 5: return "~500 TON"
+    if length == 6: return "~200 TON"
+    if length == 7: return "~100 TON"
+    if length == 8: return "~50 TON"
+    return "Менее 10 TON"
 
 # ==========================================
 # 2. БАЗА ДАННЫХ (SQLite)
@@ -76,7 +84,7 @@ async def save_username(username: str, score: int, is_dict: bool, read: int, fra
             )
             await db.commit()
     except Exception as e:
-        logging.error(f"Ошибка保存 в БД: {e}")
+        logging.error(f"Ошибка сохранения в БД: {e}")
 
 async def add_to_favorites(username: str, score: int):
     try:
@@ -105,19 +113,26 @@ class Engine:
     def __init__(self):
         print("⏳ Загрузка словаря...")
         words = get_english_words_set(['web2'], lower=True)
-        self.dict_words = {w for w in words if len(w) == 5 and w.isalpha()}
+        # Добавлены длины 6, 7 и 8
+        self.dict_words = {w for w in words if len(w) in [5, 6, 7, 8] and w.isalpha()}
         self.vowels = set("aeiouy")
+        self.consonants = "bcdfghjklmnpqrstvwxz"
         print("✅ Словарь загружен!")
 
     def generate_word(self) -> str:
-        if random.random() > 0.5 and self.dict_words:
-            return random.choice(list(self.dict_words))
-        else:
-            c = "bcdfghjklmnpqrstvwxz"
-            v = "aeiouy"
-            return random.choice(c) + random.choice(v) + random.choice(c) + random.choice(v) + random.choice(c)
+        # Вероятность выбора длины
+        length = random.choices([5, 6, 7, 8], weights=[40, 30, 20, 10])[0]
+        
+        if random.random() > 0.5:
+            words_len = [w for w in self.dict_words if len(w) == length]
+            if words_len:
+                return random.choice(words_len)
+        
+        # Генерация псевдослучайной читаемой строки нужной длины
+        return "".join(random.choice(self.consonants + "aeiou") for _ in range(length))
 
     def local_score(self, word: str) -> tuple[int, bool, int]:
+        length = len(word)
         is_dict = word in self.dict_words
         dict_score = 40 if is_dict else 0
         
@@ -129,7 +144,17 @@ class Engine:
                 read_score -= 15
         read_score = max(0, read_score)
         
-        return dict_score + read_score, is_dict, read_score
+        total = dict_score + read_score
+        
+        # Строгие фильтры оценки по длине
+        if length == 6 and total < 60:
+            return 0, False, 0
+        if length in [7, 8] and total < 80:
+            return 0, False, 0
+        if length == 5 and total < MIN_LOCAL_SCORE:
+            return 0, False, 0
+            
+        return total, is_dict, read_score
 
     async def fragment_score(self, word: str) -> int:
         url = f"https://fragment.com/?query={word}"
@@ -195,7 +220,6 @@ class MultiSessionChecker:
             return False
 
     async def get_external_data(self, username: str) -> tuple[str, str]:
-        """Безопасная выгрузка данных из @UserRate_bot с ожиданием 15 секунд"""
         now = time.time()
         time_passed = now - self.last_userrate_call
         if time_passed < 45.0:
@@ -210,13 +234,10 @@ class MultiSessionChecker:
         
         async def _fetch():
             await client.send_message(target_bot, f"@{username}")
-            logging.info(f"📤 Юзернейм @{username} отправлен @UserRate_bot. Ждем 15 секунд...")
-            
             await asyncio.sleep(15.0)  
             
             messages = await client.get_messages(target_bot, limit=5)
-            rank_info = "Не найден"
-            potential_info = "Не найден"
+            rank_info, potential_info = "Не найден", "Не найден"
             
             if messages:
                 for message in messages:
@@ -234,8 +255,7 @@ class MultiSessionChecker:
                         elif "потенциал" in line_lower or "potential" in line_lower:
                             potential_info = line.strip()
                             found_keywords = True
-                    if found_keywords:
-                        break
+                    if found_keywords: break
                         
                 if rank_info == "Не найден" and potential_info == "Не найден":
                     for message in messages:
@@ -250,7 +270,6 @@ class MultiSessionChecker:
         try:
             return await asyncio.wait_for(_fetch(), timeout=25.0)
         except asyncio.TimeoutError:
-            logging.error(f"⏰ @UserRate_bot не ответил на @{username} в течение 25 секунд.")
             return "Таймаут (Нет ответа)", "Таймаут (Нет ответа)"
         except Exception as e:
             logging.error(f"❌ Ошибка парсинга @UserRate_bot: {e}")
@@ -263,10 +282,12 @@ router = Router()
 search_task = None
 
 def get_keyboard():
+    # Полностью кнопочный интерфейс
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="▶️ Начать поиск", callback_data="start")],
-        [InlineKeyboardButton(text="⏸ Остановить поиск", callback_data="stop")],
-        [InlineKeyboardButton(text="📊 Топ-10", callback_data="top"), InlineKeyboardButton(text="⭐ Избранное", callback_data="view_favs")]
+        [InlineKeyboardButton(text="▶️ Начать поиск", callback_data="start"),
+         InlineKeyboardButton(text="⏸ Остановить поиск", callback_data="stop")],
+        [InlineKeyboardButton(text="📊 Топ-10", callback_data="top"), 
+         InlineKeyboardButton(text="⭐ Избранное", callback_data="view_favs")]
     ])
 
 def get_found_keyboard(username: str, score: int):
@@ -275,7 +296,6 @@ def get_found_keyboard(username: str, score: int):
     ])
 
 async def process_free_username(word, loc_score, is_dict, read_score, checker, engine, bot, chat_id):
-    """Отдельный изолированный фоновый подпроцесс обработки свободной находки"""
     try:
         logging.info(f"🔥 Найдено свободное имя: @{word}! Запрашиваем внешнюю аналитику...")
         frag_score = await engine.fragment_score(word)
@@ -283,10 +303,11 @@ async def process_free_username(word, loc_score, is_dict, read_score, checker, e
         
         await save_username(word, total_score, is_dict, read_score, frag_score)
         
-        # 15 секунд ожидания происходят здесь, изолированно от основного aiogram-цикла
+        ton_price = estimate_ton_price(word)
         rank, potential = await checker.get_external_data(word)
         
-        msg = (f"🔥 <b>НАЙДЕН ЮЗЕРНЕЙМ:</b> @{word}\n\n"
+        msg = (f"🔥 <b>НАЙДЕН ЮЗЕРНЕЙМ:</b> @{word}\n"
+               f"💰 <b>Примерная цена:</b> {ton_price}\n\n"
                f"📊 Наш общий балл: <b>{total_score}/100</b>\n"
                f"📖 В словаре: {'Да' if is_dict else 'Нет'}\n"
                f"🗣 Читаемость: {read_score}/30\n"
@@ -306,16 +327,16 @@ async def search_worker(checker: MultiSessionChecker, engine: Engine, bot: Bot, 
             logging.info(f"🔍 Проверка юзернейма: @{word}")
 
             loc_score, is_dict, read_score = engine.local_score(word)
-            if loc_score < MIN_LOCAL_SCORE:
-                logging.info(f"   ↳ Пропущен локально (Низкий балл: {loc_score})")
+            
+            # Если оценка 0 (не прошел пороги), пропускаем
+            if loc_score == 0:
+                logging.info(f"   ↳ Пропущен локально (Не прошел фильтр по баллам для длины {len(word)})")
                 await asyncio.sleep(WORKER_SLEEP)
                 continue 
 
             is_free = await checker.is_username_free(word)
             
             if is_free:
-                # 💥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Запускаем обработку как фоновую задачу asyncio,
-                # чтобы основной цикл генерации и проверки не вешал aiogram сетевыми паузами.
                 asyncio.create_task(
                     process_free_username(word, loc_score, is_dict, read_score, checker, engine, bot, chat_id)
                 )
@@ -335,7 +356,7 @@ async def cmd_start(message: Message):
         
     async with msg_lock:
         await message.answer(
-            "👋 Панель управления снайпером юзернеймов (Защита от сетевых таймаутов добавлена).", 
+            "👋 Панель управления снайпером юзернеймов.", 
             reply_markup=get_keyboard()
         )
 
@@ -350,7 +371,6 @@ async def start_search(cb: CallbackQuery, bot: Bot, checker: MultiSessionChecker
         await cb.message.edit_text(
             "▶️ <b>Поиск запущен!</b>\nСледи за обновлением логов каждые 15 секунд.", 
             reply_markup=get_keyboard(), 
-            get_keyboard=True,
             parse_mode="HTML"
         )
         await cb.answer()
@@ -375,6 +395,7 @@ async def show_top(cb: CallbackQuery):
             return await cb.answer("База пока пуста. Запустите поиск.", show_alert=True)
         
         text = "📊 <b>ТОП-10 ЮЗЕРНЕЙМОВ:</b>\n\n"
+        # Распаковка строго 3 переменных, так как SELECT возвращает 3 столбца
         for i, (username, score, is_dict) in enumerate(top_list, 1):
             icon = "📖" if is_dict else "🎲"
             text += f"{i}. @{username} — {score} баллов {icon}\n"
@@ -419,9 +440,9 @@ async def main():
     
     await init_db()
     
-    # Задаем дефолтные проперти и увеличиваем внутренние таймауты сетевой сессии aiogram
-    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60, connect=15))
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(), session=None) 
+    # Использование AiohttpSession для избежания "Unclosed client session"
+    session = AiohttpSession()
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(), session=session)
     
     dp = Dispatcher()
     dp.include_router(router)
@@ -437,8 +458,11 @@ async def main():
     
     await bot.delete_webhook(drop_pending_updates=True)
     
-    # Включаем мягкий режим пуллинга, игнорирующий сетевые отвалы
-    await dp.start_polling(bot, handle_as_tasks=True, relaxation=0.5)
+    try:
+        await dp.start_polling(bot, handle_as_tasks=True, relaxation=0.5)
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
