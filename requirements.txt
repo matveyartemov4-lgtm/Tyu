@@ -1,6 +1,8 @@
-aiogram==3.7.0
-aiohttp==3.9.5
+aiogram==3.12.0
+aiohttp==3.10.0
 aiosqlite==0.20.0
+telethon==1.36.0
 beautifulsoup4==4.12.3
 english-words==2.0.1
-telethon==1.36.0
+setuptools
+wheel
