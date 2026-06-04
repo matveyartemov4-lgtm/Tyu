@@ -28,7 +28,7 @@ from telethon.errors import FloodWaitError
 # ==========================================
 # 1. КОНФИГУРАЦИЯ
 # ==========================================
-BOT_TOKEN  = "8932397702:AAGY7wdLp4dy96MeSH1lce86HqzClmmMEqk"
+BOT_TOKEN  = "8932397702:AAE1QtpII14LcwxWusS84qGqQVzNObBqvjw"
 API_ID     = 33248398
 API_HASH   = "6543087387b7b14fcafcca74d28b1158"
 
