@@ -23,7 +23,7 @@ from telethon.errors import FloodWaitError, UsernameInvalidError
 # ==========================================
 # 1. КОНФИГУРАЦИЯ
 # ==========================================
-BOT_TOKEN = "8932397702:AAH7C2-aJc0uSga6otNw-on4CBGIfRAzroQ"
+BOT_TOKEN = "8932397702:AAFqNLCEPzXFEr00fD_9VB4wN8QgPaNg_lY"
 API_ID = 33248398
 API_HASH = "6543087387b7b14fcafcca74d28b1158"
 
@@ -113,14 +113,24 @@ class Engine:
     def __init__(self):
         print("⏳ Загрузка словаря...")
         words = get_english_words_set(['web2'], lower=True)
-        # Добавлены длины 6, 7 и 8
         self.dict_words = {w for w in words if len(w) in [5, 6, 7, 8] and w.isalpha()}
         self.vowels = set("aeiouy")
         self.consonants = "bcdfghjklmnpqrstvwxz"
+        self._http_session: aiohttp.ClientSession | None = None  # ФИКС: общая сессия
         print("✅ Словарь загружен!")
 
+    async def get_session(self) -> aiohttp.ClientSession:
+        """Возвращает общую HTTP-сессию, создаёт новую если закрыта."""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
+    async def close(self):
+        """Корректно закрывает HTTP-сессию."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+
     def generate_word(self) -> str:
-        # Вероятность выбора длины
         length = random.choices([5, 6, 7, 8], weights=[40, 30, 20, 10])[0]
         
         if random.random() > 0.5:
@@ -128,7 +138,6 @@ class Engine:
             if words_len:
                 return random.choice(words_len)
         
-        # Генерация псевдослучайной читаемой строки нужной длины
         return "".join(random.choice(self.consonants + "aeiou") for _ in range(length))
 
     def local_score(self, word: str) -> tuple[int, bool, int]:
@@ -146,7 +155,6 @@ class Engine:
         
         total = dict_score + read_score
         
-        # Строгие фильтры оценки по длине
         if length == 6 and total < 60:
             return 0, False, 0
         if length in [7, 8] and total < 80:
@@ -159,27 +167,27 @@ class Engine:
     async def fragment_score(self, word: str) -> int:
         url = f"https://fragment.com/?query={word}"
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as response:
-                    if response.status != 200:
-                        return 0
-                    html = await response.text()
-                    soup = BeautifulSoup(html, 'html.parser')
-                    
-                    price_elements = soup.find_all('div', class_='table-cell-value tm-value icon-before icon-ton')
-                    prices = []
-                    for el in price_elements:
-                        match = re.search(r'([\d,]+)', el.text)
-                        if match:
-                            prices.append(int(match.group(1).replace(',', '')))
-                    
-                    if not prices: return 0
-                    
-                    avg_price = sum(prices) / len(prices)
-                    if avg_price >= 500: return 30
-                    if avg_price >= 100: return 20
-                    if avg_price > 10: return 10
+            session = await self.get_session()  # ФИКС: используем общую сессию
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status != 200:
                     return 0
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                
+                price_elements = soup.find_all('div', class_='table-cell-value tm-value icon-before icon-ton')
+                prices = []
+                for el in price_elements:
+                    match = re.search(r'([\d,]+)', el.text)
+                    if match:
+                        prices.append(int(match.group(1).replace(',', '')))
+                
+                if not prices: return 0
+                
+                avg_price = sum(prices) / len(prices)
+                if avg_price >= 500: return 30
+                if avg_price >= 100: return 20
+                if avg_price > 10: return 10
+                return 0
         except Exception as e:
             logging.error(f"Ошибка Fragment: {e}")
             return 0
@@ -275,14 +283,13 @@ class MultiSessionChecker:
             logging.error(f"❌ Ошибка парсинга @UserRate_bot: {e}")
             return "Ошибка", "Ошибка"
 
-# =====================================
+# ==========================================
 # 5. AIOGRAM: ИНТЕРФЕЙС И ФОНОВЫЙ ПРОЦЕСС
 # ==========================================
 router = Router()
 search_task = None
 
 def get_keyboard():
-    # Полностью кнопочный интерфейс
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Начать поиск", callback_data="start"),
          InlineKeyboardButton(text="⏸ Остановить поиск", callback_data="stop")],
@@ -328,7 +335,6 @@ async def search_worker(checker: MultiSessionChecker, engine: Engine, bot: Bot, 
 
             loc_score, is_dict, read_score = engine.local_score(word)
             
-            # Если оценка 0 (не прошел пороги), пропускаем
             if loc_score == 0:
                 logging.info(f"   ↳ Пропущен локально (Не прошел фильтр по баллам для длины {len(word)})")
                 await asyncio.sleep(WORKER_SLEEP)
@@ -395,7 +401,6 @@ async def show_top(cb: CallbackQuery):
             return await cb.answer("База пока пуста. Запустите поиск.", show_alert=True)
         
         text = "📊 <b>ТОП-10 ЮЗЕРНЕЙМОВ:</b>\n\n"
-        # Распаковка строго 3 переменных, так как SELECT возвращает 3 столбца
         for i, (username, score, is_dict) in enumerate(top_list, 1):
             icon = "📖" if is_dict else "🎲"
             text += f"{i}. @{username} — {score} баллов {icon}\n"
@@ -436,11 +441,10 @@ async def show_favorites(cb: CallbackQuery):
 # ==========================================
 async def main():
     global msg_lock
-    msg_lock = asyncio.Lock()  
+    msg_lock = asyncio.Lock()
     
     await init_db()
     
-    # Использование AiohttpSession для избежания "Unclosed client session"
     session = AiohttpSession()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(), session=session)
     
@@ -452,7 +456,7 @@ async def main():
     
     dp.workflow_data.update({"checker": checker, "engine": engine})
     
-    await checker.start() 
+    await checker.start()
     
     print("✅ Бот готов к работе. Напиши /start в Telegram.")
     
@@ -461,8 +465,8 @@ async def main():
     try:
         await dp.start_polling(bot, handle_as_tasks=True, relaxation=0.5)
     finally:
+        await engine.close()       # ФИКС: закрываем общую aiohttp сессию
         await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
