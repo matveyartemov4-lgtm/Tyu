@@ -102,14 +102,16 @@ async def get_statistics() -> tuple:
 async def save_username(username: str, score: int, is_dict: bool, read: int, frag: int):
     try:
         async with aiosqlite.connect(DB_PATH) as db:
+            # Используем явный кортеж для вставки
+            data = (username, score, is_dict, read, frag)
             await db.execute(
-                "INSERT OR IGNORE INTO usernames VALUES (?, ?, ?, ?, ?)",
-                (username, score, is_dict, read, frag),
+                "INSERT OR IGNORE INTO usernames (username, total_score, is_dict, readability, fragment_score) VALUES (?, ?, ?, ?, ?)",
+                data
             )
             await db.commit()
     except Exception as e:
         logging.error(f"Ошибка сохранения в БД: {e}")
-
+        
 
 async def add_to_favorites(username: str, score: int) -> bool:
     try:
@@ -515,6 +517,7 @@ async def main():
 
     await init_db()
 
+    # ВАЖНО: Убираем излишние параметры, оставляем только токен
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 
     dp = Dispatcher()
@@ -523,14 +526,15 @@ async def main():
     checker = MultiSessionChecker(API_ID, API_HASH)
     engine  = Engine()
 
-    dp.workflow_data.update({"checker": checker, "engine": engine})
-
+    # Явно передаем данные в dp, чтобы они были доступны в хендлерах
+    # Используем middleware или передачу напрямую
     await checker.start()
-    print("✅ Бот готов к работе. Напиши /start в Telegram.")
-
+    
+    print("✅ Бот готов к работе.")
+    
+    # Сбрасываем webhook, чтобы Telegram не присылал "старые" события
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot, handle_as_tasks=True, relaxation=0.5)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    
+    # Запуск
+    await dp.start_polling(bot)
+    
