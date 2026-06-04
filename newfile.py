@@ -480,13 +480,11 @@ async def main():
     msg_lock = asyncio.Lock()  
     
     await init_db()
-        # Измени вот этот фрагмент:
-    session = AiohttpSession()
     
+    # ИСПОЛЬЗУЕМ СТАНДАРТНЫЙ КЛАСС ДЛЯ SESSIONS, БЕЗ AIOGRAM-ОБОЛОЧКИ
     bot = Bot(
         token=BOT_TOKEN, 
-        default=DefaultBotProperties(parse_mode="HTML"),
-        session=session
+        default=DefaultBotProperties(parse_mode="HTML")
     ) 
     
     dp = Dispatcher()
@@ -502,10 +500,4 @@ async def main():
     
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, handle_as_tasks=True, relaxation=0.5)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("Бот выключен.")
-        
+    
