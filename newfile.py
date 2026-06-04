@@ -13,13 +13,14 @@ from bs4 import BeautifulSoup
 from english_words import get_english_words_set
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 
 from telethon import TelegramClient
 from telethon.tl.functions.account import CheckUsernameRequest
-from telethon.errors import FloodWaitError, UsernameInvalidError
+from telethon.errors import FloodWaitError
 
 # ==========================================
 # 1. КОНФИГУРАЦИЯ
@@ -49,6 +50,7 @@ async def init_db():
         os.makedirs(dirname, exist_ok=True)
         
     async with aiosqlite.connect(DB_PATH) as db:
+        # Таблица успешных находок
         await db.execute("""
             CREATE TABLE IF NOT EXISTS usernames (
                 username TEXT PRIMARY KEY,
@@ -58,13 +60,42 @@ async def init_db():
                 fragment_score INTEGER
             )
         """)
+        # Таблица избранного
         await db.execute("""
             CREATE TABLE IF NOT EXISTS favorites (
                 username TEXT PRIMARY KEY,
                 score INTEGER
             )
         """)
+        # БЛЭКЛИСТ: История всех проверенных имен
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS checked_history (
+                username TEXT PRIMARY KEY,
+                checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
+
+async def is_in_blacklist(username: str) -> bool:
+    """Проверяет, проверяли ли мы уже это имя."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM checked_history WHERE username = ?", (username,)) as cursor:
+            return await cursor.fetchone() is not None
+
+async def add_to_blacklist(username: str):
+    """Добавляет имя в историю проверок."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO checked_history (username) VALUES (?)", (username,))
+        await db.commit()
+
+async def get_statistics() -> tuple[int, int]:
+    """Возвращает (всего проверено, всего найдено)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM checked_history") as c1:
+            total_checked = (await c1.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM usernames") as c2:
+            total_found = (await c2.fetchone())[0]
+    return total_checked, total_found
 
 async def save_username(username: str, score: int, is_dict: bool, read: int, frag: int):
     try:
@@ -75,7 +106,7 @@ async def save_username(username: str, score: int, is_dict: bool, read: int, fra
             )
             await db.commit()
     except Exception as e:
-        logging.error(f"Ошибка保存 в БД: {e}")
+        logging.error(f"Ошибка сохранения в БД: {e}")
 
 async def add_to_favorites(username: str, score: int):
     try:
@@ -104,17 +135,23 @@ class Engine:
     def __init__(self):
         print("⏳ Загрузка словаря...")
         words = get_english_words_set(['web2'], lower=True)
-        self.dict_words = {w for w in words if len(w) == 5 and w.isalpha()}
+        self.dict_words = {w for w in words if 5 <= len(w) <= 8 and w.isalpha()}
         self.vowels = set("aeiouy")
+        self.consonants = "bcdfghjklmnpqrstvwxz"
         print("✅ Словарь загружен!")
 
     def generate_word(self) -> str:
         if random.random() > 0.5 and self.dict_words:
             return random.choice(list(self.dict_words))
         else:
-            c = "bcdfghjklmnpqrstvwxz"
-            v = "aeiouy"
-            return random.choice(c) + random.choice(v) + random.choice(c) + random.choice(v) + random.choice(c)
+            length = random.choice([5, 6, 7, 8])
+            word = ""
+            for i in range(length):
+                if i % 2 == 0:
+                    word += random.choice(self.consonants)
+                else:
+                    word += random.choice(self.vowels)
+            return word
 
     def local_score(self, word: str) -> tuple[int, bool, int]:
         is_dict = word in self.dict_words
@@ -130,13 +167,14 @@ class Engine:
         
         return dict_score + read_score, is_dict, read_score
 
-    async def fragment_score(self, word: str) -> int:
+    async def fragment_score(self, word: str) -> tuple[int, str]:
+        """Теперь возвращает кортеж: (Балл_Fragment, Примерная_Цена_Строкой)"""
         url = f"https://fragment.com/?query={word}"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=10) as response:
                     if response.status != 200:
-                        return 0
+                        return 0, "Нет данных"
                     html = await response.text()
                     soup = BeautifulSoup(html, 'html.parser')
                     
@@ -147,16 +185,20 @@ class Engine:
                         if match:
                             prices.append(int(match.group(1).replace(',', '')))
                     
-                    if not prices: return 0
+                    if not prices: 
+                        return 0, "Нет данных"
                     
-                    avg_price = sum(prices) / len(prices)
-                    if avg_price >= 500: return 30
-                    if avg_price >= 100: return 20
-                    if avg_price > 10: return 10
-                    return 0
+                    avg_price = sum(prices) // len(prices)
+                    
+                    # Оценка баллов на основе цены
+                    if avg_price >= 500: return 30, f"~{avg_price} TON"
+                    if avg_price >= 100: return 20, f"~{avg_price} TON"
+                    if avg_price > 10: return 10, f"~{avg_price} TON"
+                    
+                    return 0, f"~{avg_price} TON (Дешево)"
         except Exception as e:
             logging.error(f"Ошибка Fragment: {e}")
-            return 0
+            return 0, "Ошибка API"
 
 # ==========================================
 # 4. РОТАЦИЯ СЕССИЙ + ИНТЕГРАЦИЯ С USERATE_BOT
@@ -194,7 +236,6 @@ class MultiSessionChecker:
             return False
 
     async def get_external_data(self, username: str) -> tuple[str, str]:
-        """Безопасная выгрузка данных из @UserRate_bot с ожиданием 15 секунд"""
         now = time.time()
         time_passed = now - self.last_userrate_call
         if time_passed < 45.0:
@@ -203,54 +244,31 @@ class MultiSessionChecker:
             await asyncio.sleep(wait_time)
             
         self.last_userrate_call = time.time()
-        
         client = self.clients[self.current_idx]
         target_bot = "@UserRate_bot"
         
         async def _fetch():
             await client.send_message(target_bot, f"@{username}")
             logging.info(f"📤 Юзернейм @{username} отправлен @UserRate_bot. Ждем 15 секунд...")
-            
             await asyncio.sleep(15.0)  
             
             messages = await client.get_messages(target_bot, limit=5)
-            rank_info = "Не найден"
-            potential_info = "Не найден"
+            rank_info, potential_info = "Не найден", "Не найден"
             
             if messages:
                 for message in messages:
-                    if not message.text or message.out:
-                        continue
-                        
-                    text = message.text
-                    lines = text.split("\n")
-                    found_keywords = False
-                    for line in lines:
-                        line_lower = line.lower()
-                        if "ранг" in line_lower or "rank" in line_lower:
-                            rank_info = line.strip()
-                            found_keywords = True
-                        elif "потенциал" in line_lower or "potential" in line_lower:
-                            potential_info = line.strip()
-                            found_keywords = True
-                    if found_keywords:
+                    if not message.text or message.out: continue
+                    text = message.text.lower()
+                    if "ранг" in text or "rank" in text or "потенциал" in text or "potential" in text:
+                        lines = message.text.split("\n")
+                        for line in lines:
+                            if "ранг" in line.lower() or "rank" in line.lower(): rank_info = line.strip()
+                            elif "потенциал" in line.lower() or "potential" in line.lower(): potential_info = line.strip()
                         break
-                        
-                if rank_info == "Не найден" and potential_info == "Не найден":
-                    for message in messages:
-                        if not message.out and message.text:
-                            lines = message.text.split("\n")
-                            rank_info = lines[0].strip()
-                            potential_info = lines[1].strip() if len(lines) > 1 else "Не определен"
-                            break
-
             return rank_info, potential_info
 
         try:
             return await asyncio.wait_for(_fetch(), timeout=25.0)
-        except asyncio.TimeoutError:
-            logging.error(f"⏰ @UserRate_bot не ответил на @{username} в течение 25 секунд.")
-            return "Таймаут (Нет ответа)", "Таймаут (Нет ответа)"
         except Exception as e:
             logging.error(f"❌ Ошибка парсинга @UserRate_bot: {e}")
             return "Ошибка", "Ошибка"
@@ -261,12 +279,15 @@ class MultiSessionChecker:
 router = Router()
 search_task = None
 
-def get_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="▶️ Начать поиск", callback_data="start")],
-        [InlineKeyboardButton(text="⏸ Остановить поиск", callback_data="stop")],
-        [InlineKeyboardButton(text="📊 Топ-10", callback_data="top"), InlineKeyboardButton(text="⭐ Избранное", callback_data="view_favs")]
-    ])
+def get_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="▶️ Начать поиск"), KeyboardButton(text="⏸ Остановить поиск")],
+            [KeyboardButton(text="📊 Топ-10"), KeyboardButton(text="⭐ Избранное")],
+            [KeyboardButton(text="📈 Статистика")] # Новая кнопка
+        ],
+        resize_keyboard=True
+    )
 
 def get_found_keyboard(username: str, score: int):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -274,52 +295,85 @@ def get_found_keyboard(username: str, score: int):
     ])
 
 async def process_free_username(word, loc_score, is_dict, read_score, checker, engine, bot, chat_id):
-    """Отдельный изолированный фоновый подпроцесс обработки свободной находки"""
     try:
         logging.info(f"🔥 Найдено свободное имя: @{word}! Запрашиваем внешнюю аналитику...")
-        frag_score = await engine.fragment_score(word)
+        
+        # Получаем и балл, и примерную цену
+        frag_score, est_price = await engine.fragment_score(word)
         total_score = loc_score + frag_score
         
         await save_username(word, total_score, is_dict, read_score, frag_score)
-        
-        # 15 секунд ожидания происходят здесь, изолированно от основного aiogram-цикла
         rank, potential = await checker.get_external_data(word)
         
-        msg = (f"🔥 <b>НАЙДЕН ЮЗЕРНЕЙМ:</b> @{word}\n\n"
+        # --- ЛОГИКА ПОДСВЕТКИ РАНГА ---
+        is_high_rank = False
+        match = re.search(r'\d+', rank)
+        if match:
+            rank_num = int(match.group(0))
+            if rank_num >= 5:
+                is_high_rank = True
+                
+        if is_high_rank:
+            logging.warning(f"🚨🚨🚨 СУПЕР НАХОДКА! @{word} получил ранг {rank}! 🚨🚨🚨")
+            msg_header = f"🚨 <b>ЖИРНЫЙ АККАУНТ! ВЫСОКИЙ РАНГ!</b> 🚨\n\n"
+        else:
+            msg_header = ""
+
+        msg = (f"{msg_header}"
+               f"🔥 <b>НАЙДЕН ЮЗЕРНЕЙМ:</b> @{word}\n\n"
                f"📊 Наш общий балл: <b>{total_score}/100</b>\n"
                f"📖 В словаре: {'Да' if is_dict else 'Нет'}\n"
                f"🗣 Читаемость: {read_score}/30\n"
-               f"💎 Fragment: {frag_score}/30\n\n"
+               f"💎 Оценка Fragment: <b>{est_price}</b> (Балл: {frag_score})\n\n"
                f"👑 <b>Данные @UserRate_bot:</b>\n"
                f"🔹 {rank}\n"
                f"⚡ {potential}")
         
-        await bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=get_found_keyboard(word, total_score))
+        await asyncio.sleep(1.0)
+        for attempt in range(3):
+            try:
+                await bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=get_found_keyboard(word, total_score))
+                break 
+            except Exception as e:
+                if "timeout" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(5)
+                else:
+                    raise e
     except Exception as e:
-        logging.error(f"Ошибка в фоновом процессоре имени @{word}: {e}")
+        logging.error(f"Ошибка в фоновом процессоре: {e}")
 
 async def search_worker(checker: MultiSessionChecker, engine: Engine, bot: Bot, chat_id: int):
     try:
         while True:
             word = engine.generate_word()
-            logging.info(f"🔍 Проверка юзернейма: @{word}")
-
             loc_score, is_dict, read_score = engine.local_score(word)
-            if loc_score < MIN_LOCAL_SCORE:
-                logging.info(f"   ↳ Пропущен локально (Низкий балл: {loc_score})")
-                await asyncio.sleep(WORKER_SLEEP)
+            
+            if len(word) >= 6 and loc_score < 60:
+                await asyncio.sleep(0.1) 
                 continue 
 
+            if loc_score < MIN_LOCAL_SCORE:
+                await asyncio.sleep(0.1) 
+                continue 
+
+            # ИНТЕЛЛЕКТУАЛЬНЫЙ БЛЭКЛИСТ
+            if await is_in_blacklist(word):
+                logging.info(f"   ↳ Пропущен (Уже проверяли): @{word}")
+                await asyncio.sleep(0.1)
+                continue
+
+            logging.info(f"🔍 Проверка (длина {len(word)}, балл {loc_score}): @{word}")
             is_free = await checker.is_username_free(word)
             
+            # Добавляем в историю (чтобы больше не проверять API для него)
+            await add_to_blacklist(word)
+            
             if is_free:
-                # 💥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Запускаем обработку как фоновую задачу asyncio,
-                # чтобы основной цикл генерации и проверки не вешал aiogram сетевыми паузами.
                 asyncio.create_task(
                     process_free_username(word, loc_score, is_dict, read_score, checker, engine, bot, chat_id)
                 )
             else:
-                logging.info(f"   ↳ Юзернейм @{word} занят в Telegram.")
+                logging.info(f"   ↳ Занят: @{word}")
 
             await asyncio.sleep(WORKER_SLEEP)
 
@@ -331,55 +385,79 @@ async def cmd_start(message: Message):
     global msg_lock
     if message.text != "/start":
         return
-        
     async with msg_lock:
         await message.answer(
-            "👋 Панель управления снайпером юзернеймов (Защита от сетевых таймаутов добавлена).", 
-            reply_markup=get_keyboard()
+            "👋 Терминал кибер-снайпера активирован.\nВыберите действие на панели:", 
+            reply_markup=get_reply_keyboard()
         )
 
-@router.callback_query(F.data == "start")
-async def start_search(cb: CallbackQuery, bot: Bot, checker: MultiSessionChecker, engine: Engine):
+@router.message(F.text == "▶️ Начать поиск")
+async def start_search(message: Message, bot: Bot, checker: MultiSessionChecker, engine: Engine):
     global search_task, msg_lock
     async with msg_lock:
         if search_task and not search_task.done():
-            return await cb.answer("⏳ Поиск уже идет!", show_alert=True)
+            return await message.answer("⏳ Поиск уже запущен!")
         
-        search_task = asyncio.create_task(search_worker(checker, engine, bot, cb.message.chat.id))
-        await cb.message.edit_text(
-            "▶️ <b>Поиск запущен!</b>\nСледи за обновлением логов каждые 15 секунд.", 
-            reply_markup=get_keyboard(), 
-            get_keyboard=True,
-            parse_mode="HTML"
-        )
-        await cb.answer()
+        search_task = asyncio.create_task(search_worker(checker, engine, bot, message.chat.id))
+        await message.answer("▶️ <b>Скрипт активирован!</b>\nСети сканируются...", parse_mode="HTML")
 
-@router.callback_query(F.data == "stop")
-async def stop_search(cb: CallbackQuery):
+@router.message(F.text == "⏸ Остановить поиск")
+async def stop_search(message: Message):
     global search_task, msg_lock
     async with msg_lock:
         if search_task and not search_task.done():
             search_task.cancel()
-            await cb.message.edit_text("⏸ <b>Поиск остановлен.</b>", reply_markup=get_keyboard(), parse_mode="HTML")
+            await message.answer("⏸ <b>Процесс сканирования приостановлен.</b>", parse_mode="HTML")
         else:
-            await cb.answer("Поиск не активен.", show_alert=True)
-        await cb.answer()
+            await message.answer("Поиск в данный момент не активен.")
 
-@router.callback_query(F.data == "top")
-async def show_top(cb: CallbackQuery):
+@router.message(F.text == "📊 Топ-10")
+async def show_top(message: Message):
     global msg_lock
     async with msg_lock:
         top_list = await get_top_10()
         if not top_list:
-            return await cb.answer("База пока пуста. Запустите поиск.", show_alert=True)
+            return await message.answer("База пока пуста. Запустите поиск.")
         
         text = "📊 <b>ТОП-10 ЮЗЕРНЕЙМОВ:</b>\n\n"
         for i, (username, score, is_dict) in enumerate(top_list, 1):
             icon = "📖" if is_dict else "🎲"
             text += f"{i}. @{username} — {score} баллов {icon}\n"
             
-        await cb.message.edit_text(text, reply_markup=get_keyboard(), parse_mode="HTML")
-        await cb.answer()
+        await message.answer(text, parse_mode="HTML")
+
+@router.message(F.text == "⭐ Избранное")
+async def show_favorites(message: Message):
+    global msg_lock
+    async with msg_lock:
+        favs = await get_favorites()
+        if not favs:
+            return await message.answer("Список избранного пуст.")
+        
+        text = "⭐ <b>ВАШЕ ИЗБРАННОЕ:</b>\n\n"
+        for i, (username, score) in enumerate(favs, 1):
+            text += f"{i}. @{username} (Балл: {score})\n"
+            
+        await message.answer(text, parse_mode="HTML")
+
+@router.message(F.text == "📈 Статистика")
+async def show_statistics(message: Message):
+    global msg_lock
+    async with msg_lock:
+        total_checked, total_found = await get_statistics()
+        
+        if total_checked > 0:
+            hit_rate = (total_found / total_checked) * 100
+        else:
+            hit_rate = 0.0
+
+        text = (
+            "📈 <b>СТАТИСТИКА БОТА:</b>\n\n"
+            f"📡 Запросов к Telegram API: <b>{total_checked}</b>\n"
+            f"🔥 Успешных находок: <b>{total_found}</b>\n"
+            f"🎯 Эффективность сканирования: <b>{hit_rate:.2f}%</b>"
+        )
+        await message.answer(text, parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("fav_"))
 async def handle_add_favorite(cb: CallbackQuery):
@@ -394,21 +472,6 @@ async def handle_add_favorite(cb: CallbackQuery):
     else:
         await cb.answer("Ошибка при сохранении.", show_alert=True)
 
-@router.callback_query(F.data == "view_favs")
-async def show_favorites(cb: CallbackQuery):
-    global msg_lock
-    async with msg_lock:
-        favs = await get_favorites()
-        if not favs:
-            return await cb.answer("Список избранного пуст.", show_alert=True)
-        
-        text = "⭐ <b>ВАШЕ ИЗБРАННОЕ:</b>\n\n"
-        for i, (username, score) in enumerate(favs, 1):
-            text += f"{i}. @{username} (Балл: {score})\n"
-            
-        await cb.message.edit_text(text, reply_markup=get_keyboard(), parse_mode="HTML")
-        await cb.answer()
-
 # ==========================================
 # 6. ТОЧКА ВХОДА
 # ==========================================
@@ -418,9 +481,15 @@ async def main():
     
     await init_db()
     
-    # Задаем дефолтные проперти и увеличиваем внутренние таймауты сетевой сессии aiogram
-    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60, connect=15))
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(), session=None) 
+    session = AiohttpSession(
+        timeout=aiohttp.ClientTimeout(total=60, connect=20, sock_read=20)
+    )
+    
+    bot = Bot(
+        token=BOT_TOKEN, 
+        default=DefaultBotProperties(parse_mode="HTML"),
+        session=session
+    ) 
     
     dp = Dispatcher()
     dp.include_router(router)
@@ -431,14 +500,14 @@ async def main():
     dp.workflow_data.update({"checker": checker, "engine": engine})
     
     await checker.start() 
-    
     print("✅ Бот готов к работе. Напиши /start в Telegram.")
     
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    # Включаем мягкий режим пуллинга, игнорирующий сетевые отвалы
     await dp.start_polling(bot, handle_as_tasks=True, relaxation=0.5)
 
 if __name__ == "__main__":
-    asyncio.run(main())
-                        
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Бот выключен.")
+        
